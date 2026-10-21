@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice 3D Studio</title>
+<!-- Optional 3D viewer (loads from Google's CDN). Without internet you still get a download link. -->
+<script type="module" src="https://ajax.googleapis.com/ajax/libs/model-viewer/4.0.0/model-viewer.min.js"></script>
+<style>
+  :root { --bg:#fff; --fg:#1c1c1e; --muted:#6b6b70; --card:#f3f3f5; --accent:#4f46e5; --ok:#16a34a; --err:#dc2626; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#111113; --fg:#f2f2f3; --muted:#9a9aa0; --card:#1d1d20; --accent:#818cf8; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.45 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width:760px; margin:0 auto; padding:16px; display:grid; gap:12px; }
+  h1 { font-size:20px; margin:0; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  button { font:inherit; padding:10px 16px; border-radius:10px; border:0; background:var(--accent); color:#fff; cursor:pointer; }
+  button.secondary { background:var(--card); color:var(--fg); }
+  button:disabled { opacity:.5; cursor:default; }
+  input[type=text] { flex:1; min-width:180px; font:inherit; padding:10px; border-radius:10px; border:1px solid var(--card); background:var(--card); color:var(--fg); }
+  .chip { font-size:13px; padding:4px 10px; border-radius:999px; background:var(--card); color:var(--muted); }
+  .card { background:var(--card); border-radius:12px; padding:12px; }
+  #log { height:240px; overflow:auto; display:flex; flex-direction:column; gap:8px; }
+  .b { padding:8px 12px; border-radius:12px; max-width:88%; white-space:pre-wrap; }
+  .b.user { align-self:flex-end; background:var(--accent); color:#fff; }
+  .b.assistant { align-self:flex-start; background:var(--bg); }
+  .b.sys { align-self:center; font-size:13px; color:var(--muted); }
+  .b.err { align-self:center; font-size:13px; color:var(--err); }
+  progress { width:100%; height:10px; }
+  model-viewer { width:100%; height:340px; background:var(--bg); border-radius:10px; }
+  .hint { font-size:13px; color:var(--muted); }
+  ul { margin:6px 0 0; padding-left:18px; }
+</style>
+</head>
+<body>
+<main>
+  <div class="row"><h1>Voice 3D Studio</h1><span id="status" class="chip">disconnected</span></div>
+
+  <div class="row">
+    <button id="toggle">Start talking</button>
+    <span class="hint">Use headphones to avoid echo. Try: “Make me a 3D wooden treasure chest.”</span>
+  </div>
+
+  <div id="log" class="card"></div>
+
+  <div class="row">
+    <input id="txt" type="text" placeholder="…or type a command and press Enter" disabled>
+    <button id="send" class="secondary" disabled>Send</button>
+  </div>
+
+  <div id="jobCard" class="card" hidden>
+    <div id="jobText" class="hint"></div>
+    <progress id="jobBar" max="100" value="0"></progress>
+  </div>
+
+  <div id="viewerCard" class="card" hidden>
+    <div id="viewerTitle" class="hint"></div>
+    <model-viewer id="viewer" camera-controls auto-rotate shadow-intensity="1" exposure="1"></model-viewer>
+    <div class="row"><a id="dl" target="_blank" rel="noopener">Open / download .glb</a></div>
+    <ul id="parts"></ul>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const logEl = $("log");
+let ws = null, micCtx = null, micStream = null, playCtx = null, nextTime = 0;
+const playing = new Set();
+const current = { user: null, assistant: null };   // transcript bubbles being streamed into
+
+// ---- UI helpers --------------------------------------------------------------------------------
+function bubble(cls, text) {
+  const d = document.createElement("div");
+  d.className = "b " + cls; d.textContent = text;
+  logEl.appendChild(d); logEl.scrollTop = logEl.scrollHeight;
+  return d;
+}
+function setStatus(t) { $("status").textContent = t; }
+function addTranscript(role, text) {
+  const other = role === "user" ? "assistant" : "user";
+  current[other] = null;
+  if (!current[role]) current[role] = bubble(role, "");
+  current[role].textContent += text;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+// ---- audio out (24 kHz PCM16 from Gemini) ---------------------------------------------------------
+function playPcm(buf) {
+  if (!playCtx) return;
+  const i16 = new Int16Array(buf);
+  const f32 = new Float32Array(i16.length);
+  for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
+  const ab = playCtx.createBuffer(1, f32.length, 24000);
+  ab.copyToChannel(f32, 0);
+  const src = playCtx.createBufferSource();
+  src.buffer = ab; src.connect(playCtx.destination);
+  const t = Math.max(playCtx.currentTime, nextTime);
+  src.start(t); nextTime = t + ab.duration;
+  playing.add(src); src.onended = () => playing.delete(src);
+}
+function stopPlayback() {                     // user barged in: drop queued speech
+  playing.forEach((s) => { try { s.stop(); } catch {} });
+  playing.clear(); nextTime = 0;
+}
+
+// ---- mic capture (16 kHz PCM16 to server) ------------------------------------------------------
+const workletSrc = `
+class Capture extends AudioWorkletProcessor {
+  constructor() { super(); this.buf = new Float32Array(1600); this.n = 0; }   // 100 ms chunks
+  process(inputs) {
+    const ch = inputs[0][0];
+    if (ch) for (let i = 0; i < ch.length; i++) {
+      this.buf[this.n++] = ch[i];
+      if (this.n === this.buf.length) {
+        const out = new Int16Array(this.n);
+        for (let j = 0; j < this.n; j++) { const s = Math.max(-1, Math.min(1, this.buf[j])); out[j] = s < 0 ? s * 0x8000 : s * 0x7FFF; }
+        this.port.postMessage(out.buffer, [out.buffer]); this.n = 0;
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('capture', Capture);`;
+
+async function startMic() {
+  micStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } });
+  micCtx = new AudioContext({ sampleRate: 16000 });
+  const url = URL.createObjectURL(new Blob([workletSrc], { type: "application/javascript" }));
+  await micCtx.audioWorklet.addModule(url);
+  const src = micCtx.createMediaStreamSource(micStream);
+  const node = new AudioWorkletNode(micCtx, "capture");
+  node.port.onmessage = (e) => { if (ws && ws.readyState === 1) ws.send(e.data); };
+  const mute = micCtx.createGain(); mute.gain.value = 0;      // keeps the graph "pulled" without echoing the mic
+  src.connect(node).connect(mute).connect(micCtx.destination);
+}
+
+// ---- connection --------------------------------------------------------------------------------
+async function connect() {
+  playCtx = new AudioContext({ sampleRate: 24000 });
+  setStatus("connecting…");
+  ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+  ws.binaryType = "arraybuffer";
+  ws.onmessage = (e) => {
+    if (typeof e.data !== "string") return playPcm(e.data);
+    const ev = JSON.parse(e.data);
+    switch (ev.type) {
+      case "ready": setStatus("listening"); bubble("sys", `Connected (${ev.model}, tool mode: ${ev.tool_mode}).`); break;
+      case "transcript": addTranscript(ev.role, ev.text); break;
+      case "turn_complete": current.user = current.assistant = null; break;
+      case "interrupted": stopPlayback(); break;
+      case "job": showJob(ev); break;
+      case "model": showModel(ev); break;
+      case "error": bubble("err", ev.message); break;
+    }
+  };
+  ws.onclose = () => { cleanup(); setStatus("disconnected"); };
+  ws.onerror = () => bubble("err", "WebSocket error. Is the server running?");
+  await new Promise((res) => (ws.onopen = res));
+  try { await startMic(); } catch (err) { bubble("err", "Microphone unavailable: " + err.message + " (you can still type)."); }
+  $("toggle").textContent = "Stop"; $("txt").disabled = $("send").disabled = false;
+}
+function cleanup() {
+  if (micStream) micStream.getTracks().forEach((t) => t.stop());
+  if (micCtx) micCtx.close(); if (playCtx) playCtx.close();
+  micStream = micCtx = playCtx = null; stopPlayback();
+  $("toggle").textContent = "Start talking"; $("txt").disabled = $("send").disabled = true;
+}
+$("toggle").onclick = () => { if (ws && ws.readyState <= 1) ws.close(); else connect(); };
+
+function sendText() {
+  const t = $("txt").value.trim();
+  if (!t || !ws || ws.readyState !== 1) return;
+  bubble("user", t); ws.send(JSON.stringify({ type: "text", text: t })); $("txt").value = "";
+}
+$("send").onclick = sendText;
+$("txt").onkeydown = (e) => { if (e.key === "Enter") sendText(); };
+
+// ---- job + model display -----------------------------------------------------------------------
+function showJob(ev) {
+  $("jobCard").hidden = false;
+  $("jobText").textContent = `${ev.kind}: ${ev.status} — ${ev.message}`;
+  $("jobBar").value = ev.progress || 0;
+  if (ev.status === "success" || ev.status === "failed") setTimeout(() => ($("jobCard").hidden = true), 4000);
+}
+function showModel(ev) {
+  $("viewerCard").hidden = false;
+  $("viewerTitle").textContent = ev.kind === "segmented" ? "Segmented model (parts)" : "Generated model";
+  $("viewer").src = ev.url;
+  if (ev.preview) $("viewer").poster = ev.preview;
+  $("dl").href = ev.url;
+  const ul = $("parts"); ul.innerHTML = "";
+  (ev.parts || []).forEach((p) => {
+    const li = document.createElement("li");
+    li.textContent = `${p.name}${p.count > 1 ? " ×" + p.count : ""} — ${p.location}, ${p.relative_size}`;
+    ul.appendChild(li);
+  });
+}
+</script>
+</body>
+</html>

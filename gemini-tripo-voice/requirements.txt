@@ -1,0 +1,7 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+httpx>=0.27
+python-dotenv>=1.0
+# Live API features (3.x Live models, send_realtime_input(text=...), NON_BLOCKING tools)
+# need a recent SDK. After installing, run: pip install -U google-genai
+google-genai
